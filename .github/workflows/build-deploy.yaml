@@ -78,9 +78,15 @@ jobs:
         id: ecr
         uses: aws-actions/amazon-ecr-login@v2
 
+      - name: Compute lowercase repo name (ECR rejects uppercase)
+        id: repo
+        run: |
+          NAME=$(echo '${{ github.event.repository.name }}' | tr '[:upper:]' '[:lower:]')
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+
       - name: Ensure ECR repository exists
         env:
-          REPO_NAME: ${{ github.event.repository.name }}
+          REPO_NAME: ${{ steps.repo.outputs.name }}
         run: |
           aws ecr describe-repositories --repository-names "$REPO_NAME" 2>/dev/null || \
             aws ecr create-repository --repository-name "$REPO_NAME" \
@@ -91,7 +97,7 @@ jobs:
         id: meta
         env:
           REGISTRY: ${{ steps.ecr.outputs.registry }}
-          REPO_NAME: ${{ github.event.repository.name }}
+          REPO_NAME: ${{ steps.repo.outputs.name }}
         run: |
           TAG="${GITHUB_SHA::8}"
           IMAGE="$REGISTRY/$REPO_NAME:$TAG"
@@ -147,7 +153,7 @@ jobs:
           VALUES_PATH: ${{ inputs.gitops-values-path }}
           TAG: ${{ steps.meta.outputs.tag }}
           REGISTRY: ${{ steps.ecr.outputs.registry }}
-          REPO_NAME: ${{ github.event.repository.name }}
+          REPO_NAME: ${{ steps.repo.outputs.name }}
         run: |
           set -euo pipefail
 
@@ -186,7 +192,7 @@ jobs:
         if: inputs.gitops-repo == ''
         env:
           TAG: ${{ steps.meta.outputs.tag }}
-          REPO_NAME: ${{ github.event.repository.name }}
+          REPO_NAME: ${{ steps.repo.outputs.name }}
           AWS_ACCOUNT_ID: ${{ inputs.aws-account-id }}
           AWS_REGION: ${{ inputs.aws-region }}
         run: |
