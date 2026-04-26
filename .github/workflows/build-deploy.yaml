@@ -99,12 +99,20 @@ jobs:
           REGISTRY: ${{ steps.ecr.outputs.registry }}
           REPO_NAME: ${{ steps.repo.outputs.name }}
         run: |
+          set -euo pipefail
           TAG="${GITHUB_SHA::8}"
           IMAGE="$REGISTRY/$REPO_NAME:$TAG"
           docker build -t "$IMAGE" .
           docker push "$IMAGE"
+          DIGEST=$(docker buildx imagetools inspect "$IMAGE" --format '{{.Manifest.Digest}}')
+          if [[ ! "$DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]]; then
+            echo "::error::Could not parse sha256 digest from buildx; got: $DIGEST"
+            exit 1
+          fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
           echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+          echo "::notice::Pushed $IMAGE @ $DIGEST"
 
       # ─── Gitops write-back (cross-repo) ─────────────────────────────
 
@@ -152,6 +160,7 @@ jobs:
           BRANCH: ${{ inputs.gitops-branch }}
           VALUES_PATH: ${{ inputs.gitops-values-path }}
           TAG: ${{ steps.meta.outputs.tag }}
+          DIGEST: ${{ steps.meta.outputs.digest }}
           REGISTRY: ${{ steps.ecr.outputs.registry }}
           REPO_NAME: ${{ steps.repo.outputs.name }}
         run: |
@@ -169,22 +178,25 @@ jobs:
           fi
 
           # yq is pre-installed on ubuntu-latest runners (Mike Farah v4).
-          # Surgical YAML updates — only image.repository + image.tag.
+          # Surgical YAML updates — image.repository + image.tag + image.digest.
+          # Digest is the runtime-pinning source (Kyverno PSS Restricted requires it);
+          # tag is kept as a human breadcrumb for debugging.
           yq -i ".image.repository = \"${REGISTRY}/${REPO_NAME}\"" "$VALUES_PATH"
           yq -i ".image.tag = \"${TAG}\"" "$VALUES_PATH"
+          yq -i ".image.digest = \"${DIGEST}\"" "$VALUES_PATH"
 
           if git diff --quiet "$VALUES_PATH"; then
-            echo "::notice::No changes to ${VALUES_PATH} (already at tag ${TAG})"
+            echo "::notice::No changes to ${VALUES_PATH} (already at digest ${DIGEST})"
             exit 0
           fi
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add "$VALUES_PATH"
-          git commit -m "chore(${REPO_NAME}): bump image to ${TAG} [skip ci]"
+          git commit -m "chore(${REPO_NAME}): bump image to ${TAG} (${DIGEST}) [skip ci]"
           git push origin "$BRANCH"
 
-          echo "::notice::Updated ${OWNER}/${REPO}/${VALUES_PATH} to tag ${TAG}"
+          echo "::notice::Updated ${OWNER}/${REPO}/${VALUES_PATH} to ${TAG} @ ${DIGEST}"
 
       # ─── Legacy self-repo write-back (fallback) ─────────────────────
 
@@ -192,14 +204,16 @@ jobs:
         if: inputs.gitops-repo == ''
         env:
           TAG: ${{ steps.meta.outputs.tag }}
+          DIGEST: ${{ steps.meta.outputs.digest }}
           REPO_NAME: ${{ steps.repo.outputs.name }}
           AWS_ACCOUNT_ID: ${{ inputs.aws-account-id }}
           AWS_REGION: ${{ inputs.aws-region }}
         run: |
-          sed -i "s|repository: .*|repository: ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/$REPO_NAME|" values.yaml
-          sed -i "s|tag: .*|tag: $TAG|" values.yaml
+          yq -i ".image.repository = \"${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${REPO_NAME}\"" values.yaml
+          yq -i ".image.tag = \"${TAG}\"" values.yaml
+          yq -i ".image.digest = \"${DIGEST}\"" values.yaml
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add values.yaml
-          git diff --cached --quiet || git commit -m "chore: update image to ${GITHUB_SHA::8} [skip ci]"
+          git diff --cached --quiet || git commit -m "chore: update image to ${TAG} (${DIGEST}) [skip ci]"
           git push
