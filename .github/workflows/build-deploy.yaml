@@ -1,5 +1,23 @@
 name: Build & Deploy (Reusable)
 
+# Reusable workflow consumed by per-app `<app>/.github/workflows/deploy.yaml`.
+#
+# Behaviors:
+#   1. OIDC login to AWS via the shared `github-actions-ci` IAM role
+#   2. Login to ECR + auto-create the per-app repo on first push
+#   3. Build Dockerfile from repo root
+#   4. Tag image with first 8 chars of GITHUB_SHA + push to ECR
+#   5. Write-back the new tag/repository to a values.yaml — TWO modes:
+#
+#      a) gitops mode (recommended) — when `gitops-repo` +
+#         `gitops-values-path` inputs are set, clones the gitops repo,
+#         updates the file at the given path, commits + pushes back.
+#         Uses a GitHub App installation token (cross-repo write).
+#
+#      b) legacy self-repo mode (fallback) — when gitops-repo is
+#         empty, updates `values.yaml` in the calling repo (kept for
+#         repos that haven't migrated to centralized gitops).
+
 on:
   workflow_call:
     inputs:
@@ -13,19 +31,40 @@ on:
         required: true
         type: string
 
+      # Gitops write-back mode (recommended)
+      gitops-repo:
+        required: false
+        type: string
+        default: ""
+        description: "Target gitops repo as <owner>/<repo>. When set, write-back goes here instead of the calling repo."
+      gitops-values-path:
+        required: false
+        type: string
+        default: ""
+        description: "Path inside gitops-repo to the values.yaml that holds image.repository + image.tag."
+      gitops-branch:
+        required: false
+        type: string
+        default: "main"
+        description: "Branch in gitops-repo to commit to. Default: main."
+
+    secrets:
+      gitops-app-id:
+        required: false
+        description: "GitHub App ID for cross-repo write-back. Required when gitops-repo is set."
+      gitops-app-private-key:
+        required: false
+        description: "GitHub App private key (PEM). Required when gitops-repo is set."
+
 permissions:
-  id-token: write
-  contents: write
+  id-token: write   # OIDC AssumeRoleWithWebIdentity
+  contents: write   # legacy self-repo write-back fallback
 
 jobs:
   build-push:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Set repo name (lowercase for ECR compatibility)
-        id: repo
-        run: echo "name=$(echo '${{ github.event.repository.name }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
 
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
@@ -39,7 +78,7 @@ jobs:
 
       - name: Ensure ECR repository exists
         env:
-          REPO_NAME: ${{ steps.repo.outputs.name }}
+          REPO_NAME: ${{ github.event.repository.name }}
         run: |
           aws ecr describe-repositories --repository-names "$REPO_NAME" 2>/dev/null || \
             aws ecr create-repository --repository-name "$REPO_NAME" \
@@ -50,18 +89,91 @@ jobs:
         id: meta
         env:
           REGISTRY: ${{ steps.ecr.outputs.registry }}
-          REPO_NAME: ${{ steps.repo.outputs.name }}
+          REPO_NAME: ${{ github.event.repository.name }}
         run: |
           TAG="${GITHUB_SHA::8}"
           IMAGE="$REGISTRY/$REPO_NAME:$TAG"
           docker build -t "$IMAGE" .
           docker push "$IMAGE"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
 
-      - name: Update image in values.yaml
+      # ─── Gitops write-back (cross-repo) ─────────────────────────────
+
+      - name: Parse gitops-repo into owner / repo
+        if: inputs.gitops-repo != ''
+        id: gitops-parse
+        env:
+          GITOPS_REPO: ${{ inputs.gitops-repo }}
+        run: |
+          IFS='/' read -r OWNER REPO <<< "$GITOPS_REPO"
+          if [ -z "$OWNER" ] || [ -z "$REPO" ]; then
+            echo "::error::gitops-repo must be in <owner>/<repo> format, got: $GITOPS_REPO"
+            exit 1
+          fi
+          echo "owner=$OWNER" >> "$GITHUB_OUTPUT"
+          echo "repo=$REPO" >> "$GITHUB_OUTPUT"
+
+      - name: Generate gitops App installation token
+        if: inputs.gitops-repo != ''
+        id: gitops-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.gitops-app-id }}
+          private-key: ${{ secrets.gitops-app-private-key }}
+          owner: ${{ steps.gitops-parse.outputs.owner }}
+          repositories: ${{ steps.gitops-parse.outputs.repo }}
+
+      - name: Update image in gitops values file
+        if: inputs.gitops-repo != ''
+        env:
+          TOKEN: ${{ steps.gitops-token.outputs.token }}
+          OWNER: ${{ steps.gitops-parse.outputs.owner }}
+          REPO: ${{ steps.gitops-parse.outputs.repo }}
+          BRANCH: ${{ inputs.gitops-branch }}
+          VALUES_PATH: ${{ inputs.gitops-values-path }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          REPO_NAME: ${{ github.event.repository.name }}
+        run: |
+          set -euo pipefail
+
+          GITOPS_DIR="$(mktemp -d)"
+          git clone --depth 1 --branch "$BRANCH" \
+            "https://x-access-token:${TOKEN}@github.com/${OWNER}/${REPO}.git" "$GITOPS_DIR"
+          cd "$GITOPS_DIR"
+
+          if [ ! -f "$VALUES_PATH" ]; then
+            echo "::error::values path not found in ${OWNER}/${REPO}: $VALUES_PATH"
+            ls -la "$(dirname "$VALUES_PATH")" 2>/dev/null || echo "  (parent dir does not exist)"
+            exit 1
+          fi
+
+          # yq is pre-installed on ubuntu-latest runners (Mike Farah v4).
+          # Surgical YAML updates — only image.repository + image.tag.
+          yq -i ".image.repository = \"${REGISTRY}/${REPO_NAME}\"" "$VALUES_PATH"
+          yq -i ".image.tag = \"${TAG}\"" "$VALUES_PATH"
+
+          if git diff --quiet "$VALUES_PATH"; then
+            echo "::notice::No changes to ${VALUES_PATH} (already at tag ${TAG})"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "$VALUES_PATH"
+          git commit -m "chore(${REPO_NAME}): bump image to ${TAG} [skip ci]"
+          git push origin "$BRANCH"
+
+          echo "::notice::Updated ${OWNER}/${REPO}/${VALUES_PATH} to tag ${TAG}"
+
+      # ─── Legacy self-repo write-back (fallback) ─────────────────────
+
+      - name: Update image in self values.yaml (legacy)
+        if: inputs.gitops-repo == ''
         env:
           TAG: ${{ steps.meta.outputs.tag }}
-          REPO_NAME: ${{ steps.repo.outputs.name }}
+          REPO_NAME: ${{ github.event.repository.name }}
           AWS_ACCOUNT_ID: ${{ inputs.aws-account-id }}
           AWS_REGION: ${{ inputs.aws-region }}
         run: |
