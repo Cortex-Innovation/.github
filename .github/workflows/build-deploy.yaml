@@ -48,10 +48,15 @@ on:
         default: "main"
         description: "Branch in gitops-repo to commit to. Default: main."
 
-    # NOTE: GITOPS_APP_ID + GITOPS_APP_PRIVATE_KEY org secrets are required
-    # when gitops-repo is set. Caller must use `secrets: inherit` to make
-    # them available — explicit `workflow_call.secrets` pass-through with
-    # hyphenated names produced empty values at runtime in testing.
+      gitops-app-id:
+        required: false
+        type: string
+        default: ""
+        description: "GitHub App ID (numeric, NOT secret) used to mint cross-repo write tokens. Required when gitops-repo is set."
+
+    # PEM secret (GITOPS_APP_PRIVATE_KEY) reaches via `secrets: inherit`
+    # at the caller. App ID is passed as a regular input above (it's
+    # public information; no need to mask).
 
 permissions:
   id-token: write   # OIDC AssumeRoleWithWebIdentity
@@ -111,12 +116,23 @@ jobs:
           echo "owner=$OWNER" >> "$GITHUB_OUTPUT"
           echo "repo=$REPO" >> "$GITHUB_OUTPUT"
 
+      - name: Verify gitops PEM secret reaches the reusable workflow
+        if: inputs.gitops-repo != ''
+        env:
+          PEM: ${{ secrets.GITOPS_APP_PRIVATE_KEY }}
+        run: |
+          if [ -z "${PEM:-}" ]; then
+            echo "::error::GITOPS_APP_PRIVATE_KEY is empty in this workflow context. Caller must use \`secrets: inherit\` AND the org secret must allow this repo."
+            exit 1
+          fi
+          echo "::notice::GITOPS_APP_PRIVATE_KEY reached (length=${#PEM})"
+
       - name: Generate gitops App installation token
         if: inputs.gitops-repo != ''
         id: gitops-token
         uses: actions/create-github-app-token@v1
         with:
-          app-id: ${{ secrets.GITOPS_APP_ID }}
+          app-id: ${{ inputs.gitops-app-id }}
           private-key: ${{ secrets.GITOPS_APP_PRIVATE_KEY }}
           owner: ${{ steps.gitops-parse.outputs.owner }}
           repositories: ${{ steps.gitops-parse.outputs.repo }}
