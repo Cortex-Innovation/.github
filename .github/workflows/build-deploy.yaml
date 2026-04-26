@@ -48,13 +48,10 @@ on:
         default: "main"
         description: "Branch in gitops-repo to commit to. Default: main."
 
-    secrets:
-      gitops-app-id:
-        required: false
-        description: "GitHub App ID for cross-repo write-back. Required when gitops-repo is set."
-      gitops-app-private-key:
-        required: false
-        description: "GitHub App private key (PEM). Required when gitops-repo is set."
+    # NOTE: GITOPS_APP_ID + GITOPS_APP_PRIVATE_KEY org secrets are required
+    # when gitops-repo is set. Caller must use `secrets: inherit` to make
+    # them available — explicit `workflow_call.secrets` pass-through with
+    # hyphenated names produced empty values at runtime in testing.
 
 permissions:
   id-token: write   # OIDC AssumeRoleWithWebIdentity
@@ -119,8 +116,8 @@ jobs:
         id: gitops-token
         uses: actions/create-github-app-token@v1
         with:
-          app-id: ${{ secrets.gitops-app-id }}
-          private-key: ${{ secrets.gitops-app-private-key }}
+          app-id: ${{ secrets.GITOPS_APP_ID }}
+          private-key: ${{ secrets.GITOPS_APP_PRIVATE_KEY }}
           owner: ${{ steps.gitops-parse.outputs.owner }}
           repositories: ${{ steps.gitops-parse.outputs.repo }}
 
