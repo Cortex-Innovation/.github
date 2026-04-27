@@ -281,25 +281,36 @@ jobs:
           COMMIT_URL="https://github.com/${GITHUB_REPOSITORY}/commit/${GITHUB_SHA}"
           APP_SOURCE_URL="https://github.com/${GITHUB_REPOSITORY}"
 
-          # Reproduce the static entries from the ApplicationSet template
-          # (App source + Values overlay) so `argocd app set --info`
-          # (which replaces the whole list) keeps them present.
-          INFO_ARGS=(
-            --info "App source=${APP_SOURCE_URL}"
-          )
-          if [ -n "${GITOPS_REPO:-}" ] && [ -n "${VALUES_PATH:-}" ]; then
-            INFO_ARGS+=(
-              --info "Values overlay=https://github.com/${GITOPS_REPO}/blob/main/${VALUES_PATH}"
-            )
-          fi
-          INFO_ARGS+=(
-            --info "Image=${REGISTRY}/${REPO_NAME}:${TAG}"
-            --info "Digest=${DIGEST}"
-            --info "Commit=${COMMIT_URL}"
-            --info "Built=${BUILT_AT}"
-          )
+          # Argo CD v3.x removed `argocd app set --info`; use `app patch`
+          # with a merge patch instead. The patch replaces the whole
+          # `spec.info` array — so the static entries declared in the
+          # ApplicationSet template (App source + Values overlay) are
+          # re-sent on every call to keep them present in the UI.
+          INFO_JSON='[]'
+          INFO_JSON=$(jq -nc \
+            --arg app_source "${APP_SOURCE_URL}" \
+            --arg values_overlay_repo "${GITOPS_REPO:-}" \
+            --arg values_overlay_path "${VALUES_PATH:-}" \
+            --arg image "${REGISTRY}/${REPO_NAME}:${TAG}" \
+            --arg digest "${DIGEST}" \
+            --arg commit "${COMMIT_URL}" \
+            --arg built "${BUILT_AT}" \
+            '
+            [{name: "App source", value: $app_source}]
+            + (if $values_overlay_repo != "" and $values_overlay_path != ""
+               then [{name: "Values overlay", value: ("https://github.com/" + $values_overlay_repo + "/blob/main/" + $values_overlay_path)}]
+               else []
+               end)
+            + [
+                {name: "Image",  value: $image},
+                {name: "Digest", value: $digest},
+                {name: "Commit", value: $commit},
+                {name: "Built",  value: $built}
+              ]
+            ')
 
-          argocd app set "${APP}" --grpc-web "${INFO_ARGS[@]}"
+          PATCH=$(jq -nc --argjson info "$INFO_JSON" '{spec: {info: $info}}')
+          argocd app patch "${APP}" --type merge --patch "$PATCH" --grpc-web
 
           echo "::notice::Updated Argo CD Application '${APP}' info with ${TAG} @ ${DIGEST}"
 
