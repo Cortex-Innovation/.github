@@ -255,7 +255,27 @@ jobs:
           else
             git commit -m "chore(${REPO_NAME}): bump image to ${TAG} (${DIGEST}) [skip ci]"
           fi
-          git push origin "$BRANCH"
+          # Retry-with-rebase on push race. When multiple repos build at the
+          # same time (e.g. operator creates N projects in cortex-projects in
+          # quick succession), each build-deploy workflow pulls cortex-gitops
+          # main, creates its own values.yaml in a separate dir, and pushes.
+          # The first push wins; subsequent ones get
+          # "remote rejected: cannot lock ref" (non-fast-forward). Each new
+          # commit is in a different file path with no real conflict, so
+          # `pull --rebase` reconciles cleanly. 3 attempts cover dozens of
+          # concurrent builds; jittered sleep avoids thundering herd.
+          for attempt in 1 2 3; do
+            if git push origin "$BRANCH"; then
+              break
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              echo "::error::push to ${OWNER}/${REPO} ${BRANCH} failed after 3 attempts (concurrent build race)"
+              exit 1
+            fi
+            echo "::warning::push race attempt $attempt — pulling rebase + retry"
+            git pull --rebase origin "$BRANCH"
+            sleep $((RANDOM % 5 + 1))
+          done
 
           echo "::notice::${MODE^} ${OWNER}/${REPO}/${VALUES_PATH} to ${TAG} @ ${DIGEST}"
 
@@ -292,7 +312,21 @@ jobs:
           git commit -m "chore: remove seed ${SOURCE_PATH} (now owned by cortex-gitops) [skip ci]"
           # Use the caller-workflow's GITHUB_TOKEN; permissions:contents:write
           # is granted by the caller's deploy.yaml (templates already set it).
-          git push origin "HEAD:${GITHUB_REF_NAME}"
+          # Retry-with-rebase: app repo could have received another push
+          # between our checkout and now (rare but possible when the
+          # build-deploy workflow runs alongside an unrelated CI commit).
+          for attempt in 1 2 3; do
+            if git push origin "HEAD:${GITHUB_REF_NAME}"; then
+              break
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              echo "::error::caller-repo cleanup push failed after 3 attempts"
+              exit 1
+            fi
+            echo "::warning::push race attempt $attempt — pulling rebase + retry"
+            git pull --rebase origin "${GITHUB_REF_NAME}"
+            sleep $((RANDOM % 5 + 1))
+          done
           echo "::notice::Removed seed ${SOURCE_PATH} from caller repo (one-shot post-seed cleanup)."
 
       # ─── Argo CD UI write-back (spec.info) ──────────────────────────
