@@ -42,6 +42,16 @@ on:
         type: string
         default: ""
         description: "Path inside gitops-repo to the values.yaml that holds image.repository + image.tag."
+      gitops-values-source:
+        required: false
+        type: string
+        default: "helm-values/values.yaml"
+        description: |
+          Path inside the CALLING repo to the source values.yaml that
+          this workflow uses to seed the gitops file on first push
+          (when gitops-values-path does not exist yet). Default:
+          `helm-values/values.yaml`. Subsequent pushes only inject
+          image fields and do not re-seed.
       gitops-branch:
         required: false
         type: string
@@ -178,10 +188,12 @@ jobs:
           REPO: ${{ steps.gitops-parse.outputs.repo }}
           BRANCH: ${{ inputs.gitops-branch }}
           VALUES_PATH: ${{ inputs.gitops-values-path }}
+          SOURCE_PATH: ${{ inputs.gitops-values-source }}
           TAG: ${{ steps.meta.outputs.tag }}
           DIGEST: ${{ steps.meta.outputs.digest }}
           REGISTRY: ${{ steps.ecr.outputs.registry }}
           REPO_NAME: ${{ steps.repo.outputs.name }}
+          CALLER_REPO_DIR: ${{ github.workspace }}
         run: |
           set -euo pipefail
 
@@ -190,21 +202,47 @@ jobs:
             "https://x-access-token:${TOKEN}@github.com/${OWNER}/${REPO}.git" "$GITOPS_DIR"
           cd "$GITOPS_DIR"
 
+          # Two modes:
+          # - File missing in gitops → SEED MODE: copy from caller repo's
+          #   helm-values/values.yaml (or whatever `gitops-values-source`
+          #   says), then inject image fields. This happens on the first
+          #   successful build of a project bootstrapped via Crossplane —
+          #   the Composition does NOT pre-create the gitops file (it
+          #   used to, with placeholder image, which made the AppSet
+          #   spawn a broken pod before the build ran).
+          # - File exists → UPDATE MODE: only inject image fields,
+          #   leaving the rest owned by whoever last edited the file.
+          MODE="update"
           if [ ! -f "$VALUES_PATH" ]; then
-            echo "::error::values path not found in ${OWNER}/${REPO}: $VALUES_PATH"
-            ls -la "$(dirname "$VALUES_PATH")" 2>/dev/null || echo "  (parent dir does not exist)"
-            exit 1
+            MODE="seed"
+            SOURCE_FULL="$CALLER_REPO_DIR/$SOURCE_PATH"
+            if [ ! -f "$SOURCE_FULL" ]; then
+              echo "::error::Source values not found in calling repo: $SOURCE_PATH"
+              echo "  (looked at: $SOURCE_FULL)"
+              exit 1
+            fi
+            mkdir -p "$(dirname "$VALUES_PATH")"
+            cp "$SOURCE_FULL" "$VALUES_PATH"
           fi
 
           # yq is pre-installed on ubuntu-latest runners (Mike Farah v4).
-          # Surgical YAML updates — image.repository + image.tag + image.digest.
-          # Digest is the runtime-pinning source (Kyverno PSS Restricted requires it);
-          # tag is kept as a human breadcrumb for debugging.
+          # On seed: also write fullnameOverride/nameOverride/service-label
+          # (these are derived from the repo name, not authored by the dev).
+          if [ "$MODE" = "seed" ]; then
+            yq -i ".fullnameOverride = \"${REPO_NAME}\"" "$VALUES_PATH"
+            yq -i ".nameOverride = \"${REPO_NAME}\"" "$VALUES_PATH"
+            yq -i ".commonLabels[\"estabilis.io/service\"] = \"${REPO_NAME}\"" "$VALUES_PATH"
+          fi
+
+          # Image fields owned by every build (seed and update both).
+          # Digest is the runtime-pinning source (Kyverno PSS Restricted
+          # requires it); tag is a human breadcrumb for debugging.
           yq -i ".image.repository = \"${REGISTRY}/${REPO_NAME}\"" "$VALUES_PATH"
           yq -i ".image.tag = \"${TAG}\"" "$VALUES_PATH"
           yq -i ".image.digest = \"${DIGEST}\"" "$VALUES_PATH"
 
-          if git diff --quiet "$VALUES_PATH"; then
+          # `git status` covers BOTH modify (update) and add (seed).
+          if [ -z "$(git status --porcelain "$VALUES_PATH")" ]; then
             echo "::notice::No changes to ${VALUES_PATH} (already at digest ${DIGEST})"
             exit 0
           fi
@@ -212,10 +250,14 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add "$VALUES_PATH"
-          git commit -m "chore(${REPO_NAME}): bump image to ${TAG} (${DIGEST}) [skip ci]"
+          if [ "$MODE" = "seed" ]; then
+            git commit -m "feat(${REPO_NAME}): seed values.yaml + first image ${TAG} (${DIGEST}) [skip ci]"
+          else
+            git commit -m "chore(${REPO_NAME}): bump image to ${TAG} (${DIGEST}) [skip ci]"
+          fi
           git push origin "$BRANCH"
 
-          echo "::notice::Updated ${OWNER}/${REPO}/${VALUES_PATH} to ${TAG} @ ${DIGEST}"
+          echo "::notice::${MODE^} ${OWNER}/${REPO}/${VALUES_PATH} to ${TAG} @ ${DIGEST}"
 
       # ─── Argo CD UI write-back (spec.info) ──────────────────────────
       #
