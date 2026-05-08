@@ -259,6 +259,42 @@ jobs:
 
           echo "::notice::${MODE^} ${OWNER}/${REPO}/${VALUES_PATH} to ${TAG} @ ${DIGEST}"
 
+      # ─── Caller-repo cleanup: remove the seed file ────────────────────
+      #
+      # The seed `helm-values/values.yaml` in the calling repo is only
+      # consumed once (the first time `gitops-values-path` does not
+      # exist in cortex-gitops). After that, it's misleading noise — the
+      # source of truth for runtime config is the cortex-gitops
+      # values.yaml. Remove it from the app repo on the first
+      # successful seed so devs don't think edits there matter.
+      #
+      # Idempotent: if the file isn't there, this is a no-op. The
+      # `[skip ci]` tag on the cleanup commit prevents this push from
+      # re-triggering the workflow.
+      - name: Remove seed helm-values from caller repo
+        if: inputs.gitops-repo != ''
+        env:
+          SOURCE_PATH: ${{ inputs.gitops-values-source }}
+        run: |
+          set -euo pipefail
+          if [ ! -f "$SOURCE_PATH" ]; then
+            echo "::notice::Seed file not present at $SOURCE_PATH — nothing to clean up."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm "$SOURCE_PATH"
+          # Drop the parent dir if it became empty (e.g. helm-values/).
+          PARENT=$(dirname "$SOURCE_PATH")
+          if [ -d "$PARENT" ] && [ -z "$(ls -A "$PARENT")" ]; then
+            rmdir "$PARENT"
+          fi
+          git commit -m "chore: remove seed ${SOURCE_PATH} (now owned by cortex-gitops) [skip ci]"
+          # Use the caller-workflow's GITHUB_TOKEN; permissions:contents:write
+          # is granted by the caller's deploy.yaml (templates already set it).
+          git push origin "HEAD:${GITHUB_REF_NAME}"
+          echo "::notice::Removed seed ${SOURCE_PATH} from caller repo (one-shot post-seed cleanup)."
+
       # ─── Argo CD UI write-back (spec.info) ──────────────────────────
       #
       # Append image/digest/commit/built entries to the Application's
