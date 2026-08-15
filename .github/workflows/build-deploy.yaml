@@ -31,6 +31,22 @@ on:
         required: true
         type: string
 
+      build-args:
+        required: false
+        type: string
+        default: ""
+        description: |
+          Extra `--build-arg` entries for `docker build`, one KEY=VALUE per
+          line. Blank lines and lines starting with `#` are ignored.
+
+          APP_VERSION (short SHA) and APP_REVISION (full SHA) are always
+          passed and do not belong here.
+
+          Non-secret values only. Build args are recorded in the image
+          history and readable by anyone who can pull the image. For a
+          secret, use a BuildKit secret mount instead — see
+          SENTRY_AUTH_TOKEN in the secrets note below.
+
       # Gitops write-back mode (recommended)
       gitops-repo:
         required: false
@@ -84,6 +100,18 @@ on:
     # Secrets reaching via `secrets: inherit` at the caller:
     # - GITOPS_APP_PRIVATE_KEY — required when gitops-repo is set
     # - ARGOCD_AUTH_TOKEN     — required when argocd-server is set
+    # - SENTRY_AUTH_TOKEN     — optional. When present, it is mounted into
+    #   `docker build` as a BuildKit secret with id `sentry_auth_token`, so a
+    #   Dockerfile can upload source maps during the build:
+    #
+    #     RUN --mount=type=secret,id=sentry_auth_token,required=false \
+    #         SENTRY_AUTH_TOKEN="$(cat /run/secrets/sentry_auth_token 2>/dev/null || true)" \
+    #         npm run build
+    #
+    #   Absent secret, absent flag: builds that do not use it are untouched.
+    #   No `secrets:` block is declared on purpose — adding one would change
+    #   what `secrets: inherit` delivers to the callers that already depend
+    #   on the two secrets above.
     # App ID is passed as a regular input above (it's public information;
     # no need to mask).
 
@@ -127,11 +155,44 @@ jobs:
         env:
           REGISTRY: ${{ steps.ecr.outputs.registry }}
           REPO_NAME: ${{ steps.repo.outputs.name }}
+          EXTRA_BUILD_ARGS: ${{ inputs.build-args }}
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+          # BuildKit is the default on the hosted runners already; setting it
+          # explicitly is a no-op there and guarantees `--secret` is available.
+          DOCKER_BUILDKIT: "1"
         run: |
           set -euo pipefail
           TAG="${GITHUB_SHA::8}"
           IMAGE="$REGISTRY/$REPO_NAME:$TAG"
-          docker build -t "$IMAGE" .
+
+          # APP_VERSION / APP_REVISION are declared as ARG by the app templates
+          # and feed the OCI image labels. They were never passed, so every
+          # image in the registry carried `version=dev` and an empty revision —
+          # the labels claimed to identify the build and identified nothing.
+          # A build arg the Dockerfile does not declare is a warning, not an
+          # error, so repos without those ARGs are unaffected.
+          BUILD_ARGS=(--build-arg "APP_VERSION=$TAG" --build-arg "APP_REVISION=$GITHUB_SHA")
+
+          # Optional extras from the caller, one KEY=VALUE per line.
+          while IFS= read -r line; do
+            line="${line%$'\r'}"
+            [ -z "${line// /}" ] && continue
+            case "$line" in \#*) continue ;; esac
+            BUILD_ARGS+=(--build-arg "$line")
+          done <<< "${EXTRA_BUILD_ARGS:-}"
+
+          # Secrets must NOT travel as build args: those are recorded in the
+          # image history and readable by anyone who can pull the image. A
+          # BuildKit secret is mounted for the duration of one RUN and leaves
+          # no trace in any layer. Absent secret, absent flag — the 40-odd
+          # repos that do not set it build exactly as before.
+          if [ -n "${SENTRY_AUTH_TOKEN:-}" ]; then
+            BUILD_ARGS+=(--secret id=sentry_auth_token,env=SENTRY_AUTH_TOKEN)
+            echo "::notice::Sentry auth token available to the build (BuildKit secret mount)"
+          fi
+
+          echo "::notice::docker build with ${#BUILD_ARGS[@]} extra flag(s)"
+          docker build "${BUILD_ARGS[@]}" -t "$IMAGE" .
           docker push "$IMAGE"
           DIGEST=$(docker buildx imagetools inspect "$IMAGE" --format '{{.Manifest.Digest}}')
           if [[ ! "$DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]]; then
