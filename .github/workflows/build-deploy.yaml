@@ -428,8 +428,28 @@ jobs:
           chmod +x /usr/local/bin/argocd
           argocd version --client | head -1
 
+      # NON-FATAL ON PURPOSE.
+      #
+      #   This step is cosmetic: it enriches the Argo CD UI Summary panel so a
+      #   multi-source app shows the real app version instead of only the
+      #   common-app chart version. Useful, but it must never turn a green
+      #   build red.
+      #
+      #   It needs `applications, update` on the app's AppProject. That grant
+      #   was REMOVED from the `ci-writeback` account on 2026-08-19
+      #   (cortex-platform-aws-us-east-1-prd#189): `update` allows rewriting the
+      #   Application spec, and while the AppProject bounds the blast radius,
+      #   `destinations` is a wildcard over `app-*` — so it would allow making
+      #   one app deploy into another app's namespace. The account is meant to
+      #   trigger a sync, nothing more.
+      #
+      #   So this step is EXPECTED to log a 403 today. The sync step below is
+      #   the one that matters and it does not need `update`. If the enrichment
+      #   ever becomes worth the grant, restore the RBAC line and drop this
+      #   `continue-on-error`.
       - name: Update Argo CD Application spec.info
         if: inputs.argocd-server != ''
+        continue-on-error: true
         env:
           ARGOCD_SERVER: ${{ inputs.argocd-server }}
           ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
