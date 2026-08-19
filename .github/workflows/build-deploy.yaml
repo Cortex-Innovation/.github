@@ -487,6 +487,56 @@ jobs:
 
           echo "::notice::Updated Argo CD Application '${APP}' info with ${TAG} @ ${DIGEST}"
 
+      # ─── Immediate sync trigger ─────────────────────────────────────
+      #
+      # WHY THIS EXISTS
+      #
+      #   Without it the cluster only picks up the new image when Argo CD's
+      #   reconciliation loop comes around. On the prd cluster that is
+      #   `timeout.reconciliation: 120s` plus `timeout.reconciliation.jitter:
+      #   60s` — UP TO THREE MINUTES. The pipeline finishes "success" while the
+      #   previous version is still serving, and whoever checks right after the
+      #   merge concludes the deploy failed. That confusion is the reason this
+      #   step was added.
+      #
+      # NO RACE WITH THE GITOPS COMMIT
+      #
+      #   `Update image in gitops values file` runs far earlier in this same
+      #   job, so by the time this step executes the new value is already on
+      #   the GitOps repo's main branch. The sync reads the committed state,
+      #   not a pending one.
+      #
+      # WHY --async
+      #
+      #   It fires and returns. The step still FAILS if the CALL fails — a
+      #   broken integration (bad token, RBAC, unreachable server) must be
+      #   visible — but it does not wait for the rollout, so CI stays
+      #   decoupled from cluster health.
+      #
+      #   To make the build ALSO go red when the DEPLOY itself fails, drop
+      #   `--async`: the step then blocks until Argo CD converges. That is a
+      #   deliberate contract change for every repo passing `argocd-server`,
+      #   which is why it is not the default here.
+      #
+      # RBAC
+      #
+      #   The `ci-writeback` account needs `applications, sync` on the app's
+      #   AppProject. Until 2026-08-19 that grant pointed at a project that did
+      #   not exist (`workload-infra`), so the account could do nothing at all
+      #   — including the `app patch` above. Fixed in
+      #   cortex-platform-aws-us-east-1-prd#188, currently scoped to a
+      #   two-app pilot.
+      - name: Trigger Argo CD sync
+        if: inputs.argocd-server != ''
+        env:
+          ARGOCD_SERVER: ${{ inputs.argocd-server }}
+          ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
+          APP: ${{ steps.argocd-app.outputs.name }}
+        run: |
+          set -euo pipefail
+          argocd app sync "${APP}" --async --timeout 60 --grpc-web
+          echo "::notice::Argo CD sync triggered for '${APP}'"
+
       # ─── Legacy self-repo write-back (fallback) ─────────────────────
 
       - name: Update image in self values.yaml (legacy)
