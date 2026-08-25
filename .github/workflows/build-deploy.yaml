@@ -259,8 +259,47 @@ jobs:
           set -euo pipefail
 
           GITOPS_DIR="$(mktemp -d)"
-          git clone --depth 1 --branch "$BRANCH" \
-            "https://x-access-token:${TOKEN}@github.com/${OWNER}/${REPO}.git" "$GITOPS_DIR"
+
+          # Retry the clone: a freshly minted GitHub App installation token is
+          # not immediately usable on every GitHub edge cache. The token is
+          # valid — the mint step above succeeded — but a clone routed to a
+          # cache that has not replicated it yet is answered as if the repo did
+          # not exist:
+          #
+          #   remote: Repository not found.
+          #   fatal: repository '.../cortex-gitops.git/' not found   (exit 128)
+          #
+          # This is GitHub's own explanation and their recommended mitigation
+          # (wait, then retry with growing backoff) — see
+          # https://github.com/aws-amplify/amplify-hosting/issues/4080, where
+          # AWS Amplify shipped exactly this fix. The replication delay is not
+          # exposed by any API, so it cannot be waited out deterministically.
+          #
+          # Measured here on 2026-08-25: 3 failed attempts across 25 runs, each
+          # needing a manual re-run. The backoff below (3s, 10s, 30s) is the
+          # interval GitHub support recommends. It also absorbs plain transport
+          # flakes mid-transfer (`fatal: expected 'packfile'`), which accounted
+          # for one of those three.
+          #
+          # The push steps further down already retry; this was the only bare
+          # git operation left in the workflow.
+          clone_ok=""
+          for delay in 0 3 10 30; do
+            [ "$delay" -gt 0 ] && sleep "$delay"
+            if git clone --depth 1 --branch "$BRANCH" \
+                 "https://x-access-token:${TOKEN}@github.com/${OWNER}/${REPO}.git" "$GITOPS_DIR"; then
+              clone_ok=1
+              break
+            fi
+            # git leaves the target dir behind on a partial clone; a retry into
+            # a non-empty directory fails for the wrong reason.
+            rm -rf "${GITOPS_DIR:?}"/* "${GITOPS_DIR:?}"/.[!.]* 2>/dev/null || true
+            echo "::warning::clone of ${OWNER}/${REPO} failed (token replication or transport); retrying"
+          done
+          if [ -z "$clone_ok" ]; then
+            echo "::error::clone of ${OWNER}/${REPO} failed after 4 attempts (0s, 3s, 10s, 30s)"
+            exit 1
+          fi
           cd "$GITOPS_DIR"
 
           # Two modes:
